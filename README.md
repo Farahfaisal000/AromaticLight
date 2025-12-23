@@ -76,10 +76,3 @@ The system is controlled through a mobile application that allows:
 - **Reem Hasan**
 
 
-
-
-
-
-
-This project was prepared as a partial requirement for the Bachelor’s degree in Computer Engineering at An-Najah National University.  
-The university holds no responsibility for the statements, results, or conclusions presented in this project.
