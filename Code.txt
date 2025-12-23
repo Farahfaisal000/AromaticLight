@@ -1,0 +1,719 @@
+ #include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
+#include <AccelStepper.h>
+#include <Servo.h>
+#include "max6675.h"
+// ======================= LCD =======================
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// ======================= Keypad ====================
+const byte ROWS = 4, COLS = 4;
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+byte rowPins[ROWS] = {A0, A1, A2, A3};
+byte colPins[COLS] = {A4, A5, A6, A7};
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// ================== Stepper & Servo =================
+#define STEP_PIN 6
+#define DIR_PIN 7
+#define HALL_PIN 10
+AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
+
+#define STEP_PIN2 49
+#define DIR_PIN2  51
+AccelStepper liftStepper(AccelStepper::DRIVER, STEP_PIN2, DIR_PIN2);
+
+Servo servoParaffin;  // البارافين
+Servo servoSoya;      // الصويا
+
+// ================== Relay ==========================
+#define RELAY_PIN 50   // ريلاي الخلاط
+
+// ================== اختيارات المستخدم =================
+int waxType = 0;       // 1=Soya, 2=Paraffin
+int colorChoice = 0;   // 1,2,3 (مكس)
+int colorPercent = 0;  // 1=20% 2=50% 3=70%
+int perfumeChoice = 0; // 1 أو 2
+int perfumePercent = 0;// 1=20% 2=50% 3=70%
+int moldsChoice = 0;   // 1,2,3
+int phase = -1;
+
+// ================== خطوات الحركة ====================
+long stepsToWax = 0;
+long stepsToColor1 = 0;
+long stepsToColor2 = 0;
+long stepsToPerfume = 0; // إلى العطر (يعتمد على الاختيارات)
+long stepsToMix = 0;     // إلى الخلاط
+
+// ================== Pins للستبرات الخاصة بالضخ =================
+#define stepPinScent2    4   // عطر2
+#define dirPinScent2     24
+#define stepPinScent1    5 // عطر1
+#define dirPinScent1     25
+#define stepPinColor2    9   // لون2
+#define dirPinColor2     29
+#define stepPinColor1    8  // لون1
+#define dirPinColor1     28
+
+int offStepperPins[] = {2,3,4,5,11,12,8,9,24,25,28,29,49,51};
+void initializePinsLow() {
+  for (int i = 0; i < sizeof(offStepperPins) / sizeof(offStepperPins[0]); i++) {
+    pinMode(offStepperPins[i], OUTPUT);
+    digitalWrite(offStepperPins[i], LOW); // إطفاء البنات
+  }
+}
+// ================== متغيرات النسب =================
+int steps20 = 0, steps50 = 0, steps70 = 0;
+int selectedColorSteps = 0;
+int selectedPerfumeSteps = 0;
+#define FAN_PIN 52   // البن الموصل للمروحة
+bool fanRunning = false;
+unsigned long fanStartTime = 0;
+void startFan() {
+  digitalWrite(FAN_PIN, HIGH); // شغّل المروحة
+  fanRunning = true;
+  fanStartTime = millis();
+}
+
+void runFanNonBlocking() {
+  if (fanRunning) {
+    if (millis() - fanStartTime >= 300000) { // دقيقه
+      digitalWrite(FAN_PIN, LOW);  // طفي المروحة
+      fanRunning = false;
+    }
+  }
+}
+
+// ================== دوال الحركة التدريجية =================
+void gradualMove(Servo &servo, int startAngle, int endAngle, int step, int delayStep) {
+  if(startAngle < endAngle){
+    for(int pos = startAngle; pos <= endAngle; pos += step){
+      servo.write(pos);
+      delay(delayStep);
+    }
+  } else {
+    for(int pos = startAngle; pos >= endAngle; pos -= step){
+      servo.write(pos);
+      delay(delayStep);
+    }
+  }
+}
+
+// ================== تشغيل سيرفو البارافين =================
+void runParaffinServo(int moldsChoice) {
+  int delayTime;
+  if (moldsChoice == 1) delayTime = 1000;
+  else if (moldsChoice == 2) delayTime = 25;
+  else if (moldsChoice == 3) delayTime = 20;
+  else delayTime = 900;
+
+  gradualMove(servoParaffin, 150, 60, 1, 30);
+  delay(delayTime);
+  gradualMove(servoParaffin, 60, 150, 2, 30);
+}
+
+// ================== تشغيل سيرفو الصويا =================
+void runSoyaServo(int moldsChoice) {
+  int delayTime;
+  if (moldsChoice == 1) delayTime = 900;
+  else if (moldsChoice == 2) delayTime = 2400;
+  else if (moldsChoice == 3) delayTime = 3550;
+  else delayTime = 900;
+
+  gradualMove(servoSoya, 5, 90, 1, 20);
+  delay(delayTime);
+  gradualMove(servoSoya, 90, 5, 1, 20);
+}
+// ================== كود السخان ===================
+const int heaterRelayPin = 42;
+int thermoSO  = 35;
+int thermoCS  = 37;
+int thermoCLK = 36;
+MAX6675 thermocouple(thermoCLK, thermoCS, thermoSO);
+
+const float targetTemp = 200.0;
+const unsigned long onTime = 2000;
+const unsigned long offTime = 5000;
+unsigned long lastToggleTime = 0;
+bool heaterOn = false;
+const unsigned long runDuration = 5UL*60UL*1000UL; 
+unsigned long heaterStartTime = 0;
+bool heaterFinished = false;
+
+void runHeaterProcess() {
+  if(heaterFinished) return;
+
+  unsigned long now = millis();
+  float currentTemp = thermocouple.readCelsius();
+
+  if(heaterStartTime == 0) heaterStartTime = now;
+
+  // 23 دقيقة
+  if(now - heaterStartTime >= runDuration){
+    digitalWrite(heaterRelayPin, HIGH);
+    heaterOn = false;
+    heaterFinished = true;
+    lcd.clear(); lcd.print("Heater Done 23m");
+    return;
+  }
+
+  if(currentTemp >= targetTemp && currentTemp>0){
+    digitalWrite(heaterRelayPin, HIGH);
+    heaterOn = false;
+  } else {
+    if(!heaterOn && (now - lastToggleTime >= offTime)){
+      digitalWrite(heaterRelayPin, LOW);
+      heaterOn = true;
+      lastToggleTime = now;
+    } else if(heaterOn && (now - lastToggleTime >= onTime)){
+      digitalWrite(heaterRelayPin, HIGH);
+      heaterOn = false;
+      lastToggleTime = now;
+    }
+  }
+}
+// ================== دالة تحريك ستبر الضخ =================
+void stepperMove(int stepPin, int steps){
+  for(int x=0; x<steps; x++){
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(1000);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(1000);
+  }
+}
+
+// ================== دوال المنيو ======================
+void resetMenu() {
+  waxType = colorChoice = colorPercent = perfumeChoice = perfumePercent = moldsChoice = 0;
+  selectedColorSteps = selectedPerfumeSteps = 0;
+  steps20 = steps50 = steps70 = 0;
+  stepsToPerfume = 0;
+  phase = -1;
+    lcd.clear();
+  delay(50);
+  lcd.noBacklight();   // نفض سريع لو الشاشة معلّقة
+  delay(50);
+  lcd.backlight();
+  delay(50);
+
+    // رسالة ترحيبية
+  lcd.setCursor(2,0); lcd.print("Welcome to");
+  lcd.setCursor(0,1); lcd.print("Candle Machine ");
+  delay(2000);
+  lcd.clear();
+
+  lcd.setCursor(0,0); lcd.print("Select Wax Type:");
+  lcd.setCursor(0,1); lcd.print("A: Soya");
+  lcd.setCursor(0,2); lcd.print("B: Paraffin");
+}
+// ================== الكود الثاني (الصب) ==================
+#define STEP_PIN_MAIN 11
+#define DIR_PIN_MAIN  12
+#define LIMIT_BACK    13
+#define LDR_PIN       47
+#define STEP_PIN_HEATER 2
+#define DIR_PIN_HEATER  3
+#define LASER_CUT_STATE HIGH
+
+AccelStepper conveyor(AccelStepper::DRIVER, STEP_PIN_MAIN, DIR_PIN_MAIN);
+AccelStepper heaterStepper(AccelStepper::DRIVER, STEP_PIN_HEATER, DIR_PIN_HEATER);
+enum State {
+  WAIT_USER,
+  HOMING,
+  MOVE_FORWARD,
+  HEATER_DELAY_BEFORE,
+  HEATER_OPENING,
+  HEATER_WAITING,
+  HEATER_CLOSING,
+  HEATER_DELAY_AFTER,
+  WAIT_FOR_LIGHT,  // 🔑 الانتظار حتى يرجع الليزر
+  RETURN_HOME,
+  STOPPED
+};
+
+State currentState = WAIT_USER;
+unsigned long waitStartTime = 0;
+
+int targetCups = 3;  // مثال: 3 قوالب
+int cupsCount = 0;
+bool lastLaserState = false;
+
+bool laserInterrupted() {
+    static int stableCount = 0;
+    static bool lastStableState = false;
+    bool current = digitalRead(LDR_PIN) == LASER_CUT_STATE;
+
+    if (current == lastStableState) {
+        stableCount++;
+    } else {
+        stableCount = 0;
+        lastStableState = current;
+    }
+
+    if (stableCount >= 3) { // استقرار 3 قراءات متتالية
+        return current;
+    }
+    return !LASER_CUT_STATE; // افتراض عدم القطع إذا غير مستقر
+}
+
+
+
+// ================== الفنكشن الخاصة بالصب ==================
+void runPouringProcess() {
+  bool currentLaser = laserInterrupted();
+
+  switch (currentState) {
+
+    case HOMING:
+      if (digitalRead(LIMIT_BACK) == LOW) {
+        conveyor.stop();
+        delay(200);  // يمكن استبداله بـ millis() إذا أحببت
+        conveyor.setCurrentPosition(0);
+        lcd.clear(); lcd.print("Home Done");
+        conveyor.setSpeed(600);
+        currentState = MOVE_FORWARD;
+      } else conveyor.runSpeed();
+      break;
+
+    case MOVE_FORWARD:
+      conveyor.runSpeed();
+      // اكتشاف قالب جديد فقط عند انتقال الليزر من غير مقطوع لمقطوع
+      if (currentLaser && !lastLaserState) {
+        cupsCount++;
+        lcd.clear(); lcd.print("Cup: "); lcd.print(cupsCount);
+        conveyor.stop();
+        waitStartTime = millis();
+        currentState = HEATER_DELAY_BEFORE;
+         lastLaserState = currentLaser; // حدثه هنا فقط بعد اكتشاف القالب
+      }
+      // تحديث lastLaserState في كل مرة لتتبع كل القوالب
+      lastLaserState = currentLaser;
+      break;
+
+    case HEATER_DELAY_BEFORE:
+      if (millis() - waitStartTime >= 1000) {  // انتظر 1 ثانية قبل السخان
+        heaterStepper.moveTo(170);
+        currentState = HEATER_OPENING;
+      }
+      break;
+
+    case HEATER_OPENING:
+      if (heaterStepper.distanceToGo() != 0) heaterStepper.run();
+      else {
+        lcd.clear(); lcd.print("Heater Open");
+        waitStartTime = millis();
+        currentState = HEATER_WAITING;
+      }
+      break;
+
+    case HEATER_WAITING:
+      if (millis() - waitStartTime >= 500) {  // صب القالب
+        heaterStepper.moveTo(0);
+        currentState = HEATER_CLOSING;
+      }
+      break;
+
+    case HEATER_CLOSING:
+      if (heaterStepper.distanceToGo() != 0) heaterStepper.run();
+      else {
+        lcd.clear(); lcd.print("Heater Close");
+        waitStartTime = millis();
+        currentState = HEATER_DELAY_AFTER;
+      }
+      break;
+
+    case HEATER_DELAY_AFTER:
+      if (millis() - waitStartTime >= 1500) {  // انتظار قبل تشغيل السير للقالب التالي
+        if (cupsCount >= targetCups) {
+          lcd.clear(); lcd.print("Cups Done");
+          conveyor.setSpeed(-400);
+          currentState = RETURN_HOME;
+        } else {
+          conveyor.setSpeed(600);
+          currentState = WAIT_FOR_LIGHT;
+        }
+      }
+      break;
+
+    case WAIT_FOR_LIGHT:
+      conveyor.runSpeed();
+      // ننتظر حتى يعود الليزر إلى الحالة الطبيعية قبل متابعة القالب التالي
+      if (!currentLaser) currentState = MOVE_FORWARD;
+      lastLaserState = currentLaser;  // التحديث مهم لكل القوالب
+      break;
+
+    case RETURN_HOME:
+      if (digitalRead(LIMIT_BACK) == LOW) {
+        conveyor.stop();
+        lcd.clear(); lcd.print("All Done!");
+        currentState = STOPPED;
+      } else conveyor.runSpeed();
+      break;
+
+    case STOPPED:
+      conveyor.stop();
+      break;
+  }
+}
+
+
+// ================== الإعداد =========================
+void setup() {
+  
+  for(int i = 0; i < sizeof(offStepperPins) / sizeof(offStepperPins[0]); i++) { 
+    pinMode(offStepperPins[i], OUTPUT); 
+    digitalWrite(offStepperPins[i], LOW); 
+  }
+
+  pinMode(49, OUTPUT); digitalWrite(49, LOW);
+  pinMode(51, OUTPUT); digitalWrite(51, LOW);
+
+  pinMode(RELAY_PIN, OUTPUT); digitalWrite(RELAY_PIN, LOW);
+
+    // === LCD / I2C Robust Init ===
+  Wire.begin();            // مهم على الأردوينو ميغا
+  Wire.setClock(50000);    // إبطاء الـ I2C للثبات
+  delay(200);              // مهلة بعد التشغيل
+
+  for (int i = 0; i < 2; i++) {   // إعادة التهيئة مرتين لو أول مرة ما زبطت
+    lcd.init();            // أو lcd.begin(20,4) حسب المكتبة
+    delay(100);
+    lcd.backlight();
+    delay(50);
+    lcd.clear();
+    delay(50);
+  }
+
+
+  stepper.setMaxSpeed(1500);
+  stepper.setAcceleration(1000);
+  stepper.setSpeed(-1000);
+
+  liftStepper.setMaxSpeed(1000);
+  liftStepper.setAcceleration(200);
+
+  servoParaffin.attach(45);
+  servoSoya.attach(44);
+  servoParaffin.write(150);
+  servoSoya.write(5);
+
+  // ستبرات الضخ
+  pinMode(stepPinScent1, OUTPUT); pinMode(dirPinScent1, OUTPUT);
+  pinMode(stepPinScent2, OUTPUT); pinMode(dirPinScent2, OUTPUT);
+  pinMode(stepPinColor1, OUTPUT); pinMode(dirPinColor1, OUTPUT);
+  pinMode(stepPinColor2, OUTPUT); pinMode(dirPinColor2, OUTPUT);
+
+  // تثبيت اتجاهات DIR (عدّل HIGH/LOW حسب توجيه المضخات عندك)
+  digitalWrite(dirPinScent1, LOW);
+  digitalWrite(dirPinScent2, LOW);
+  digitalWrite(dirPinColor1, LOW );
+  digitalWrite(dirPinColor2, HIGH);
+
+  
+
+  pinMode(HALL_PIN, INPUT);
+
+  // الكود الثاني
+  pinMode(LIMIT_BACK, INPUT_PULLUP);
+  pinMode(LDR_PIN, INPUT_PULLUP);
+
+  conveyor.setMaxSpeed(1000);
+  conveyor.setAcceleration(500);
+  conveyor.setSpeed(-400);
+
+  heaterStepper.setMaxSpeed(1000);
+  heaterStepper.setAcceleration(500);
+  heaterStepper.setCurrentPosition(0);
+  heaterStepper.moveTo(0);
+pinMode(FAN_PIN, OUTPUT);
+digitalWrite(FAN_PIN, LOW);
+  pinMode(heaterRelayPin, OUTPUT); digitalWrite(heaterRelayPin, HIGH);
+  resetMenu();
+}
+
+
+// ================== الحلقة الرئيسية ==================
+void loop() {
+  char key = keypad.getKey();
+  if (key) {
+    if (key == '*') { resetMenu(); return; }
+
+    // اختيار نوع الشمع
+    if (waxType == 0 && (key=='A' || key=='B')) {
+      waxType = (key=='A')?1:2;
+      if (waxType == 1) { stepsToWax=1100; stepsToColor1=1700; stepsToColor2=2900; }
+      else { stepsToWax=2850; stepsToColor1=3500; stepsToColor2=4650; }
+
+      lcd.clear(); lcd.print((waxType==1)?"Wax: Soya":"Wax: Paraffin");
+      delay(800);
+      lcd.clear(); 
+  lcd.setCursor(0,0); lcd.print("Select Color:");
+  lcd.setCursor(0,1); lcd.print("A: Green");
+  lcd.setCursor(0,2); lcd.print("B: Yellow");
+      return;
+    }
+
+    // اختيار اللون
+    if (waxType != 0 && colorChoice == 0 && (key=='A' || key=='B' || key=='C')) {
+      colorChoice = (key=='A')?1:2; 
+      lcd.clear(); lcd.print("Color Sel");
+      delay(800);
+  lcd.clear();
+  lcd.setCursor(0,0); lcd.print("Select Color %:");
+  lcd.setCursor(0,1); lcd.print("A: 20%");
+  lcd.setCursor(0,2); lcd.print("B: 50%");
+  lcd.setCursor(0,3); lcd.print("C: 70%");
+      return;
+    }
+
+    // اختيار نسبة اللون
+    if(colorChoice != 0 && colorPercent==0 && (key=='A'||key=='B'||key=='C')){
+  if (key=='A') colorPercent=1;
+  else if (key=='B') colorPercent=2;
+  else if (key=='C') colorPercent=3;
+      selectedColorSteps = (colorPercent==1)?steps20:(colorPercent==2)?steps50:steps70;
+      lcd.clear(); lcd.print("Color% set");
+      delay(800);
+      lcd.clear(); 
+  lcd.setCursor(0,0); lcd.print("Select Perfume:");
+  lcd.setCursor(0,1); lcd.print("A: Peach");
+  lcd.setCursor(0,2); lcd.print("B: Mesflora");
+      return;
+    }
+
+    // اختيار العطر
+    if (colorPercent != 0 && perfumeChoice == 0 && (key=='A' || key=='B')) {
+      perfumeChoice = (key=='A') ? 1 : 2;
+
+      // حساب المسافة إلى موضع العطر حسب اختياراتك (كما في كودك الأصلي)
+      if (waxType == 1) {
+        if (colorChoice == 1) stepsToPerfume = (perfumeChoice==1)?2100:3050;
+        else if (colorChoice == 2) stepsToPerfume = (perfumeChoice==1)?900:1850;
+        else if (colorChoice == 3) stepsToPerfume = (perfumeChoice==1)?1000:1800;
+      } else if (waxType == 2) {
+        if (colorChoice == 1) stepsToPerfume = (perfumeChoice==1)?2000:3050;
+        else if (colorChoice == 2) stepsToPerfume = (perfumeChoice==1)?900:1900;
+        else if (colorChoice == 3) stepsToPerfume = (perfumeChoice==1)?850:1900;
+      }
+
+      lcd.clear(); lcd.print("Perfume Sel");
+      delay(800);
+      lcd.clear();
+  lcd.setCursor(0,0); lcd.print("Select Perfume %:");
+  lcd.setCursor(0,1); lcd.print("A: 20%");
+  lcd.setCursor(0,2); lcd.print("B: 50%");
+  lcd.setCursor(0,3); lcd.print("C: 70%");
+      return;
+    }
+
+    // اختيار نسبة العطر
+    if(perfumeChoice != 0 && perfumePercent==0 && (key=='A'||key=='B'||key=='C')){
+  if (key=='A') perfumePercent=1;
+  else if (key=='B') perfumePercent=2;
+  else if (key=='C') perfumePercent=3;
+      selectedPerfumeSteps = (perfumePercent==1)?steps20:(perfumePercent==2)?steps50:steps70;
+      lcd.clear(); lcd.print("Perf% set");
+      delay(800);
+      lcd.clear(); 
+  lcd.setCursor(0,0); lcd.print("Select Molds:");
+  lcd.setCursor(0,1); lcd.print("A: 1 Mold");
+  lcd.setCursor(0,2); lcd.print("B: 2 Molds");
+  lcd.setCursor(0,3); lcd.print("C: 3 Molds");
+      return;
+    }
+
+    // اختيار القوالب
+    if (perfumePercent != 0 && moldsChoice == 0 && (key=='A' || key=='B' || key=='C')) {
+      moldsChoice = (key=='A') ? 1 : (key=='B' ? 2 : 3);
+      if(moldsChoice==3){ steps20=200; steps50=450; steps70=850; }
+      else if(moldsChoice==2){ steps20=100; steps50=250; steps70=1050; }
+      else if(moldsChoice==1){ steps20=50; steps50=100; steps70=200; }
+
+      // تحديث قيم الخطوات بعد عدد القوالب
+      selectedColorSteps   = (colorPercent==1)?steps20:(colorPercent==2)?steps50:steps70;
+      selectedPerfumeSteps = (perfumePercent==1)?steps20:(perfumePercent==2)?steps50:steps70;
+
+      lcd.clear(); lcd.print("Molds: "); lcd.print(moldsChoice);
+      delay(800);
+
+      lcd.clear(); lcd.print("Starting...");
+      delay(1000);
+
+      liftStepper.setCurrentPosition(0);
+      liftStepper.moveTo(-300);  // نزول أولي
+      phase = 100; 
+      return;
+    }
+  }
+
+  // ================== التنفيذ ==================
+  if (phase == 100) {
+    liftStepper.run();
+    if (liftStepper.distanceToGo() == 0) {
+      lcd.clear(); lcd.print("Lift Done");
+      delay(500);
+      phase = 0;
+    }
+  }
+
+  // البحث عن الهوم ثم إلى الشمع
+  if (phase == 0) {
+    stepper.runSpeed();
+    if (digitalRead(HALL_PIN) == HIGH) {
+      lcd.clear(); lcd.print("Home Found");
+      stepper.stop();
+      while (stepper.isRunning()) stepper.run();
+
+      stepper.setCurrentPosition(0);
+      stepper.moveTo(-stepsToWax);
+      phase = 1;
+    }
+  }
+  // موضع الشمع → فتح السيرفو حسب النوع
+  else if (phase == 1) {
+    stepper.run();
+    if (stepper.distanceToGo() == 0) {
+      lcd.clear(); lcd.print("Wax Position");
+      if (waxType==1) runSoyaServo(moldsChoice);
+      else            runParaffinServo(moldsChoice);
+      stepper.setCurrentPosition(0);
+      if (colorChoice==1 || colorChoice==3) stepper.moveTo(stepsToColor1);
+      else                                  stepper.moveTo(stepsToColor2);
+       // 2️⃣ تشغيل السخان مباشرة بعد السيرفو
+      while (!heaterFinished) {
+          runHeaterProcess(); // هذا سيشغل السخان وفق الحرارة والوقت
+          delay(500);          // وقت للـ MAX6675
+      }
+      phase = 2;
+    }
+  }
+  // موضع اللون → ضخ اللون → إلى الخلاط
+  else if (phase == 2) {
+    stepper.run();
+    if (stepper.distanceToGo() == 0) {
+      lcd.clear(); lcd.print("Color Position");
+      delay(1000);
+      if(colorChoice==1 || colorChoice==3) stepperMove(stepPinColor1, selectedColorSteps);
+      if(colorChoice==2 || colorChoice==3) stepperMove(stepPinColor2, selectedColorSteps);
+      delay(5000);
+      stepsToMix = (colorChoice==1)?4500:3400; // حسب معايرتك
+      stepper.setCurrentPosition(0);
+      stepper.moveTo(stepsToMix);
+      phase = 55;
+    }
+  }
+  // الخلاط للّون
+  else if (phase == 55) { 
+    stepper.run();
+    if (stepper.distanceToGo() == 0) {
+      lcd.clear(); lcd.print("Mixing Position");
+      liftStepper.setCurrentPosition(0);
+      liftStepper.moveTo(300);
+      phase = 56;
+    }
+  }
+  else if (phase == 56) {
+    liftStepper.run();
+    if (liftStepper.distanceToGo() == 0) {
+      lcd.clear(); lcd.print("Mixing...");
+      digitalWrite(RELAY_PIN, HIGH);
+      delay(5000);
+      digitalWrite(RELAY_PIN, LOW);
+
+      liftStepper.setCurrentPosition(0);
+      liftStepper.moveTo(-300);
+      phase = 57;                
+    }
+  }
+  else if (phase == 57) {
+    liftStepper.run();
+    if (liftStepper.distanceToGo() == 0) {
+      phase = 4;  // بعد الرفع، العطرphase = 4;  // *** مرحلة العطر (مثل اللون) ***
+    }
+  }
+  else if (phase == 4) {
+    stepper.run();
+    if (stepper.distanceToGo() == 0) {
+      
+      delay(5000);
+      stepsToMix = (perfumeChoice == 1) ? 2380 : 1400;
+      stepper.setCurrentPosition(0);
+      stepper.moveTo(-stepsToMix);
+      phase = 3;
+    }
+  }
+
+  // ======== مرحلة العطر (تمامًا مثل اللون) ========
+  else if (phase == 3) {
+    stepper.run();
+    if (stepper.distanceToGo() == 0) {
+      lcd.clear(); lcd.print("Perfume Position");
+      delay(1000);
+      if(perfumeChoice==1) stepperMove(stepPinScent1, selectedPerfumeSteps);
+      else                 stepperMove(stepPinScent2, selectedPerfumeSteps);
+      lcd.clear(); lcd.print("Perfume Done");
+      delay(5000);
+
+      // إلى الخلاط بعد العطر
+      stepsToMix = (perfumeChoice == 1) ? 2380 : 1400; // حسب معايرتك
+      stepper.setCurrentPosition(0);
+      stepper.moveTo(stepsToMix);
+      phase = 5; // مباشرة إلى الخلط الثاني
+    }
+  }
+
+  // الخلاط للعطر
+  else if (phase == 5) {
+    stepper.run();
+    if (stepper.distanceToGo() == 0) {
+      lcd.clear(); lcd.print("Mixing Position");
+      liftStepper.setCurrentPosition(0);
+      liftStepper.moveTo(300);
+      phase = 6;
+    }
+  }
+  else if (phase == 6) {
+    liftStepper.run();
+    if (liftStepper.distanceToGo() == 0) {
+      lcd.clear(); lcd.print("Mixing...");
+      digitalWrite(RELAY_PIN, HIGH);
+      delay(5000);
+      digitalWrite(RELAY_PIN, LOW);
+
+     
+      phase = 7;
+    }
+  }
+  else if (phase == 7) {
+    liftStepper.run();
+    if (liftStepper.distanceToGo() == 0) {
+      lcd.clear(); lcd.print("Process Done!");
+      
+      targetCups = moldsChoice;   // عدد القوالب من الكيباد
+      cupsCount = 0;
+      currentState = HOMING;      // ابدأ الكود الثاني
+      phase = 40;                // انتقل لمرحلة الصب
+      
+    }
+  }
+  else if (phase == 40){
+    
+   runPouringProcess();
+   // استدعاء الفنكشن الخاصة بالمروحة
+runFanNonBlocking();
+
+// تشغيل المروحة عند العودة قبل الـ limit switch
+if (currentState == RETURN_HOME && !fanRunning) {
+  startFan();
+}
+
+   
+ }
+ 
+}
